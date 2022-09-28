@@ -80,12 +80,13 @@ if __name__ == "__main__":
     if opt['phase'] == 'train':
         while current_step < n_iter:
             current_epoch += 1
+            scaler = torch.cuda.amp.GradScaler()
             for _, train_data in enumerate(train_loader):
                 current_step += 1
                 if current_step > n_iter:
                     break
                 diffusion.feed_data(train_data)
-                diffusion.optimize_parameters()
+                diffusion.optimize_parameters(scaler)
                 # log
                 if current_step % opt['train']['print_freq'] == 0:
                     logs = diffusion.get_current_log()
@@ -117,7 +118,7 @@ if __name__ == "__main__":
                         sr_img = Metrics.tensor2img(visuals['SR'])  # uint8
                         hr_img = Metrics.tensor2img(visuals['HR'])  # uint8
                         lr_img = Metrics.tensor2img(visuals['LR'])  # uint8
-                        fake_img = Metrics.tensor2img(visuals['INF'])  # uint8
+                        # fake_img = Metrics.tensor2img(visuals['INF'])  # uint8
 
                         # generation
                         Metrics.save_img(
@@ -126,12 +127,12 @@ if __name__ == "__main__":
                             sr_img, '{}/{}_{}_sr.png'.format(result_path, current_step, idx))
                         Metrics.save_img(
                             lr_img, '{}/{}_{}_lr.png'.format(result_path, current_step, idx))
-                        Metrics.save_img(
-                            fake_img, '{}/{}_{}_inf.png'.format(result_path, current_step, idx))
+                        # Metrics.save_img(
+                        #     fake_img, '{}/{}_{}_inf.png'.format(result_path, current_step, idx))
                         tb_logger.add_image(
                             'Iter_{}'.format(current_step),
                             np.transpose(np.concatenate(
-                                (fake_img, sr_img, hr_img), axis=1), [2, 0, 1]),
+                                (sr_img, hr_img), axis=1), [2, 0, 1]),
                             idx)
                         avg_psnr += Metrics.calculate_psnr(
                             sr_img, hr_img)
@@ -139,7 +140,7 @@ if __name__ == "__main__":
                         if wandb_logger:
                             wandb_logger.log_image(
                                 f'validation_{idx}', 
-                                np.concatenate((fake_img, sr_img, hr_img), axis=1)
+                                np.concatenate((sr_img, hr_img), axis=1)
                             )
 
                     avg_psnr = avg_psnr / idx
@@ -187,7 +188,7 @@ if __name__ == "__main__":
 
             hr_img = Metrics.tensor2img(visuals['HR'])  # uint8
             lr_img = Metrics.tensor2img(visuals['LR'])  # uint8
-            fake_img = Metrics.tensor2img(visuals['INF'])  # uint8
+            # fake_img = Metrics.tensor2img(visuals['INF'])  # uint8
 
             sr_img_mode = 'grid'
             if sr_img_mode == 'single':
@@ -209,8 +210,8 @@ if __name__ == "__main__":
                 hr_img, '{}/{}_{}_hr.png'.format(result_path, current_step, idx))
             Metrics.save_img(
                 lr_img, '{}/{}_{}_lr.png'.format(result_path, current_step, idx))
-            Metrics.save_img(
-                fake_img, '{}/{}_{}_inf.png'.format(result_path, current_step, idx))
+            # Metrics.save_img(
+            #     fake_img, '{}/{}_{}_inf.png'.format(result_path, current_step, idx))
 
             # generation
             eval_psnr = Metrics.calculate_psnr(Metrics.tensor2img(visuals['SR'][-1]), hr_img)
@@ -219,8 +220,8 @@ if __name__ == "__main__":
             avg_psnr += eval_psnr
             avg_ssim += eval_ssim
 
-            if wandb_logger and opt['log_eval']:
-                wandb_logger.log_eval_data(fake_img, Metrics.tensor2img(visuals['SR'][-1]), hr_img, eval_psnr, eval_ssim)
+            # if wandb_logger and opt['log_eval']:
+            #     wandb_logger.log_eval_data(fake_img, Metrics.tensor2img(visuals['SR'][-1]), hr_img, eval_psnr, eval_ssim)
 
         avg_psnr = avg_psnr / idx
         avg_ssim = avg_ssim / idx

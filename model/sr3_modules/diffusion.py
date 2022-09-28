@@ -6,8 +6,9 @@ from inspect import isfunction
 from functools import partial
 import numpy as np
 from tqdm import tqdm
-
-
+from data.util import make_coord
+from einops import rearrange
+# from  torch.cuda.amp import autocast
 def _warmup_beta(linear_start, linear_end, n_timestep, warmup_frac):
     betas = linear_end * np.ones(n_timestep, dtype=np.float64)
     warmup_time = int(n_timestep * warmup_frac)
@@ -64,19 +65,30 @@ def default(val, d):
 class GaussianDiffusion(nn.Module):
     def __init__(
         self,
+        encoder,
+        imnet,
         denoise_fn,
         image_size,
         channels=3,
         loss_type='l1',
         conditional=True,
+        feat_unfold=False,
+        local_ensemble=False,
+        cell_decode=False,
         schedule_opt=None
     ):
         super().__init__()
         self.channels = channels
         self.image_size = image_size
+        self.encoder = encoder
+        self.imnet = imnet
         self.denoise_fn = denoise_fn
         self.loss_type = loss_type
         self.conditional = conditional
+        self.feat_unfold = feat_unfold
+        self.local_ensemble = local_ensemble
+        self.cell_decode = cell_decode
+        
         if schedule_opt is not None:
             pass
             # self.set_new_noise_schedule(schedule_opt)
@@ -155,6 +167,8 @@ class GaussianDiffusion(nn.Module):
         if condition_x is not None:
             x_recon = self.predict_start_from_noise(
                 x, t=t, noise=self.denoise_fn(torch.cat([condition_x, x], dim=1), noise_level))
+            # x_recon = self.predict_start_from_noise(
+            #     x, t=t, noise=self.denoise_fn(condition_x+ x, noise_level))
         else:
             x_recon = self.predict_start_from_noise(
                 x, t=t, noise=self.denoise_fn(x, noise_level))
@@ -186,12 +200,22 @@ class GaussianDiffusion(nn.Module):
                 if i % sample_inter == 0:
                     ret_img = torch.cat([ret_img, img], dim=0)
         else:
-            x = x_in
-            shape = x.shape
+            x = x_in['inp']
+            shape = x_in['gt'].shape
             img = torch.randn(shape, device=device)
-            ret_img = x
+            x_feat = self.gen_feat(x,shape[2:])
+            # x_con = self.query_rgb(x_feat, x_in['coord'], x_in['cell'])
+            # x_con = rearrange(x_con, 'b (h w) c -> b c h w', h=x_in['gt'].shape[-1])
+            
+            # x_con = rearrange(x_feat, 'b (h w) c -> b c h w', h=x_in['gt'].shape[-1])
+            # x_con = F.interpolate(x_in['inp'], x_in['gt'].shape[2:])
+            x_con = x_feat
+            ret_img = x_con
+            # img_feat = self.gen_feat(img)
+            # img_con = self.query_rgb(img_feat, x_in['coord'], x_in['cell'])
+            # img_con = rearrange(img_con, 'b (h w) c -> b c h w', h=x_in['gt'].shape[-1])            
             for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
-                img = self.p_sample(img, i, condition_x=x)
+                img = self.p_sample(img, i, condition_x=x_con)
                 if i % sample_inter == 0:
                     ret_img = torch.cat([ret_img, img], dim=0)
         if continous:
@@ -217,9 +241,82 @@ class GaussianDiffusion(nn.Module):
             continuous_sqrt_alpha_cumprod * x_start +
             (1 - continuous_sqrt_alpha_cumprod**2).sqrt() * noise
         )
+    def gen_feat(self, inp, shape):
+        feat = self.encoder(inp, shape)
+        return feat
 
+    def query_rgb(self, x_feat, coord, cell=None):
+        feat = x_feat
+        if self.feat_unfold:
+            feat = F.unfold(feat, 3, padding=1).view(
+                feat.shape[0], feat.shape[1] * 9, feat.shape[2], feat.shape[3])
+
+        if self.local_ensemble:
+            vx_lst = [-1, 1]
+            vy_lst = [-1, 1]
+            eps_shift = 1e-6
+        else:
+            vx_lst, vy_lst, eps_shift = [0], [0], 0
+
+        # field radius (global: [-1, 1])
+        rx = 2 / feat.shape[-2] / 2
+        ry = 2 / feat.shape[-1] / 2
+
+        feat_coord = make_coord(feat.shape[-2:], flatten=False).cuda() \
+            .permute(2, 0, 1) \
+            .unsqueeze(0).expand(feat.shape[0], 2, *feat.shape[-2:])
+
+        preds = []
+        areas = []
+        for vx in vx_lst:
+            for vy in vy_lst:
+                coord_ = coord.clone()
+                coord_[:, :, 0] += vx * rx + eps_shift
+                coord_[:, :, 1] += vy * ry + eps_shift
+                coord_.clamp_(-1 + 1e-6, 1 - 1e-6)
+                q_feat = F.grid_sample(
+                    feat, coord_.flip(-1).unsqueeze(1),
+                    mode='nearest', align_corners=False)[:, :, 0, :] \
+                    .permute(0, 2, 1)
+                q_coord = F.grid_sample(
+                    feat_coord, coord_.flip(-1).unsqueeze(1),
+                    mode='nearest', align_corners=False)[:, :, 0, :] \
+                    .permute(0, 2, 1)
+                rel_coord = coord - q_coord
+                rel_coord[:, :, 0] *= feat.shape[-2]
+                rel_coord[:, :, 1] *= feat.shape[-1]
+                inp = torch.cat([q_feat, rel_coord], dim=-1)
+
+                if self.cell_decode:
+                    rel_cell = cell.clone()
+                    rel_cell[:, :, 0] *= feat.shape[-2]
+                    rel_cell[:, :, 1] *= feat.shape[-1]
+                    inp = torch.cat([inp, rel_cell], dim=-1)
+
+                bs, q = coord.shape[:2]
+                pred = self.imnet(inp.view(bs * q, -1)).view(bs, q, -1)
+                preds.append(pred)
+
+                area = torch.abs(rel_coord[:, :, 0] * rel_coord[:, :, 1])
+                areas.append(area + 1e-9)
+
+        tot_area = torch.stack(areas).sum(dim=0)
+        if self.local_ensemble:
+            t = areas[0]; areas[0] = areas[3]; areas[3] = t
+            t = areas[1]; areas[1] = areas[2]; areas[2] = t
+        ret = 0
+        for pred, area in zip(preds, areas):
+            ret = ret + pred * (area / tot_area).unsqueeze(-1)
+        return ret
     def p_losses(self, x_in, noise=None):
-        x_start = x_in['HR']
+        inp, coord, cell = x_in['inp'], x_in['coord'], x_in['cell']
+        x_feat = self.gen_feat(inp, x_in['gt'].shape[2:])
+        # x_con = self.query_rgb(x_feat, coord, cell)
+        # x_con = rearrange(x_con, 'b (h w) c -> b c h w', h=x_in['gt'].shape[-1])
+        # x_con = rearrange(x_feat, 'b (h w) c -> b c h w', h=x_in['gt'].shape[-1])
+        x_con = x_feat
+        # x_con = F.interpolate(x_in['inp'], x_in['gt'].shape[2:])
+        x_start = x_in['gt']
         [b, c, h, w] = x_start.shape
         t = np.random.randint(1, self.num_timesteps + 1)
         continuous_sqrt_alpha_cumprod = torch.FloatTensor(
@@ -235,15 +332,17 @@ class GaussianDiffusion(nn.Module):
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(
             x_start=x_start, continuous_sqrt_alpha_cumprod=continuous_sqrt_alpha_cumprod.view(-1, 1, 1, 1), noise=noise)
-
+        # xn_feat = self.gen_feat(x_noisy)
+        # x_noisy = self.query_rgb(xn_feat, coord, cell)
+        # x_noisy = rearrange(x_noisy, 'b (h w) c -> b c h w', h=x_in['gt'].shape[-1])
         if not self.conditional:
             x_recon = self.denoise_fn(x_noisy, continuous_sqrt_alpha_cumprod)
         else:
             x_recon = self.denoise_fn(
-                torch.cat([x_in['SR'], x_noisy], dim=1), continuous_sqrt_alpha_cumprod)
-
+                torch.cat([x_con, x_noisy], dim=1), continuous_sqrt_alpha_cumprod)
+            # x_recon = self.denoise_fn(x_noisy, x_con, continuous_sqrt_alpha_cumprod)
         loss = self.loss_func(noise, x_recon)
         return loss
-
+    # @autocast()
     def forward(self, x, *args, **kwargs):
         return self.p_losses(x, *args, **kwargs)

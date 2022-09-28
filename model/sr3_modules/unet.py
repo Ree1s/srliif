@@ -1,10 +1,12 @@
 import math
+from multiprocessing.spawn import is_forking
 import torch
 from torch import nn
 import torch.nn.functional as F
 from inspect import isfunction
-
-
+import numpy as np
+from data.util import *
+from einops import rearrange
 def exists(x):
     return x is not None
 
@@ -13,6 +15,30 @@ def default(val, d):
     if exists(val):
         return val
     return d() if isfunction(d) else d
+
+class SineLayer(nn.Module):
+    def __init__(self, in_features, out_features, bias=True,
+                 is_first=False, omega_0=30):
+        super().__init__()
+        self.omega_0 = omega_0
+        self.is_first = is_first
+        
+        self.in_features = in_features
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        
+        self.init_weights()
+    
+    def init_weights(self):
+        with torch.no_grad():
+            if self.is_first:
+                self.linear.weight.uniform_(-1 / self.in_features, 
+                                             1 / self.in_features)      
+            else:
+                self.linear.weight.uniform_(-np.sqrt(6 / self.in_features) / self.omega_0, 
+                                             np.sqrt(6 / self.in_features) / self.omega_0)
+        
+    def forward(self, input):
+        return torch.sin(self.omega_0 * self.linear(input))
 
 # PositionalEncoding Source： https://github.com/lmnt-com/wavegrad/blob/master/src/wavegrad/model.py
 class PositionalEncoding(nn.Module):
@@ -54,16 +80,94 @@ class Swish(nn.Module):
     def forward(self, x):
         return x * torch.sigmoid(x)
 
-
 class Upsample(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode="nearest")
+        # self.up = nn.Upsample(scale_factor=2, mode="nearest")
         self.conv = nn.Conv2d(dim, dim, 3, padding=1)
 
-    def forward(self, x):
-        return self.conv(self.up(x))
+    def forward(self, x, shape):
+        return self.conv(F.interpolate(x, shape))
+class Liif(nn.Module):
+    def __init__(self, dim, is_first=False,feat_unfold=False,
+        local_ensemble=False,
+        cell_decode=False,):
+        super().__init__()
+        # self.up = nn.Upsample(scale_factor=2, mode="nearest")
+        # self.conv = nn.Conv2d(dim, dim, 3, padding=1)
+        self.feat_unfold = feat_unfold
+        self.local_ensemble = local_ensemble
+        self.cell_decode = cell_decode
+        
+        # self.imnet = nn.Sequential(SineLayer(dim + 2, 256, is_first=is_first),SineLayer(256, dim))
+        self.imnet = nn.Sequential(nn.Linear(dim + 2, 256),nn.Linear(256, dim))
+    def forward(self, x, shape):
+        coord = make_coord(shape).repeat(x.shape[0], 1, 1).cuda()
+        return self.query_rgb(x, coord, cell=None)
+        # return self.conv(F.interpolate(x, shape))
+    def query_rgb(self, x_feat, coord, cell=None):
+        feat = x_feat
+        if self.feat_unfold:
+            feat = F.unfold(feat, 3, padding=1).view(
+                feat.shape[0], feat.shape[1] * 9, feat.shape[2], feat.shape[3])
 
+        if self.local_ensemble:
+            vx_lst = [-1, 1]
+            vy_lst = [-1, 1]
+            eps_shift = 1e-6
+        else:
+            vx_lst, vy_lst, eps_shift = [0], [0], 0
+
+        # field radius (global: [-1, 1])
+        rx = 2 / feat.shape[-2] / 2
+        ry = 2 / feat.shape[-1] / 2
+
+        feat_coord = make_coord(feat.shape[-2:], flatten=False).cuda() \
+            .permute(2, 0, 1) \
+            .unsqueeze(0).expand(feat.shape[0], 2, *feat.shape[-2:])
+
+        preds = []
+        areas = []
+        for vx in vx_lst:
+            for vy in vy_lst:
+                coord_ = coord.clone()
+                coord_[:, :, 0] += vx * rx + eps_shift
+                coord_[:, :, 1] += vy * ry + eps_shift
+                coord_.clamp_(-1 + 1e-6, 1 - 1e-6)
+                q_feat = F.grid_sample(
+                    feat, coord_.flip(-1).unsqueeze(1),
+                    mode='nearest', align_corners=False)[:, :, 0, :] \
+                    .permute(0, 2, 1)
+                q_coord = F.grid_sample(
+                    feat_coord, coord_.flip(-1).unsqueeze(1),
+                    mode='nearest', align_corners=False)[:, :, 0, :] \
+                    .permute(0, 2, 1)
+                rel_coord = coord - q_coord
+                rel_coord[:, :, 0] *= feat.shape[-2]
+                rel_coord[:, :, 1] *= feat.shape[-1]
+                inp = torch.cat([q_feat, rel_coord], dim=-1)
+
+                if self.cell_decode:
+                    rel_cell = cell.clone()
+                    rel_cell[:, :, 0] *= feat.shape[-2]
+                    rel_cell[:, :, 1] *= feat.shape[-1]
+                    inp = torch.cat([inp, rel_cell], dim=-1)
+
+                bs, q = coord.shape[:2]
+                pred = self.imnet(inp.view(bs * q, -1)).view(bs, q, -1)
+                preds.append(pred)
+
+                area = torch.abs(rel_coord[:, :, 0] * rel_coord[:, :, 1])
+                areas.append(area + 1e-9)
+
+        tot_area = torch.stack(areas).sum(dim=0)
+        if self.local_ensemble:
+            t = areas[0]; areas[0] = areas[3]; areas[3] = t
+            t = areas[1]; areas[1] = areas[2]; areas[2] = t
+        ret = 0
+        for pred, area in zip(preds, areas):
+            ret = ret + pred * (area / tot_area).unsqueeze(-1)
+        return ret
 
 class Downsample(nn.Module):
     def __init__(self, dim):
@@ -71,6 +175,7 @@ class Downsample(nn.Module):
         self.conv = nn.Conv2d(dim, dim, 3, 2, 1)
 
     def forward(self, x):
+        # return F.interpolate(x, scale_factor=0.5)
         return self.conv(x)
 
 
@@ -123,7 +228,8 @@ class SelfAttention(nn.Module):
     def forward(self, input):
         batch, channel, height, width = input.shape
         n_head = self.n_head
-        head_dim = channel // n_head
+        head_dim = channel // n_head 
+        # b * pixels * features +coord -> b * pixels *rgb
 
         norm = self.norm(input)
         qkv = self.qkv(norm).view(batch, n_head, head_dim * 3, height, width)
@@ -217,6 +323,7 @@ class UNet(nn.Module):
         ups = []
         for ind in reversed(range(num_mults)):
             is_last = (ind < 1)
+            is_first = (ind == 3)
             use_attn = (now_res in attn_res)
             channel_mult = inner_channel * channel_mults[ind]
             for _ in range(0, res_blocks+1):
@@ -225,7 +332,8 @@ class UNet(nn.Module):
                         dropout=dropout, with_attn=use_attn))
                 pre_channel = channel_mult
             if not is_last:
-                ups.append(Upsample(pre_channel))
+                # ups.append(Upsample(pre_channel))
+                ups.append(Liif(pre_channel, is_first=is_first))
                 now_res = now_res*2
 
         self.ups = nn.ModuleList(ups)
@@ -250,10 +358,12 @@ class UNet(nn.Module):
             else:
                 x = layer(x)
 
-        for layer in self.ups:
+        for i, layer in enumerate(self.ups):
             if isinstance(layer, ResnetBlocWithAttn):
                 x = layer(torch.cat((x, feats.pop()), dim=1), t)
             else:
-                x = layer(x)
+                x = layer(x, feats[-1].shape[2:])
+                x = rearrange(x, 'b (h w) c -> b c h w', h=feats[-1].shape[-1])
 
         return self.final_conv(x)
+

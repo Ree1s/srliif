@@ -3,6 +3,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from inspect import isfunction
+import numpy as np
 
 def exists(x):
     return x is not None
@@ -13,25 +14,40 @@ def default(val, d):
         return val
     return d() if isfunction(d) else d
 
-# model
-
-
-class TimeEmbedding(nn.Module):
+# PositionalEncoding Source： https://github.com/lmnt-com/wavegrad/blob/master/src/wavegrad/model.py
+class PositionalEncoding(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-        inv_freq = torch.exp(
-            torch.arange(0, dim, 2, dtype=torch.float32) *
-            (-math.log(10000) / dim)
-        )
-        self.register_buffer("inv_freq", inv_freq)
 
-    def forward(self, input):
-        shape = input.shape
-        sinusoid_in = torch.ger(input.view(-1).float(), self.inv_freq)
-        pos_emb = torch.cat([sinusoid_in.sin(), sinusoid_in.cos()], dim=-1)
-        pos_emb = pos_emb.view(*shape, self.dim)
-        return pos_emb
+    def forward(self, noise_level):
+        count = self.dim // 2
+        step = torch.arange(count, dtype=noise_level.dtype,
+                            device=noise_level.device) / count
+        encoding = noise_level.unsqueeze(
+            1) * torch.exp(-math.log(1e4) * step.unsqueeze(0))
+        encoding = torch.cat(
+            [torch.sin(encoding), torch.cos(encoding)], dim=-1)
+        return encoding
+
+
+class FeatureWiseAffine(nn.Module):
+    def __init__(self, in_channels, out_channels, use_affine_level=False):
+        super(FeatureWiseAffine, self).__init__()
+        self.use_affine_level = use_affine_level
+        self.noise_func = nn.Sequential(
+            nn.Linear(in_channels, out_channels*(1+self.use_affine_level))
+        )
+
+    def forward(self, x, noise_embed):
+        batch = x.shape[0]
+        if self.use_affine_level:
+            gamma, beta = self.noise_func(noise_embed).view(
+                batch, -1, 1, 1).chunk(2, dim=1)
+            x = (1 + gamma) * x + beta
+        else:
+            x = x + self.noise_func(noise_embed).view(batch, -1, 1, 1)
+        return x
 
 
 class Swish(nn.Module):
@@ -68,30 +84,28 @@ class Block(nn.Module):
             nn.GroupNorm(groups, dim),
             Swish(),
             nn.Dropout(dropout) if dropout != 0 else nn.Identity(),
-            nn.Conv2d(dim, dim_out, 3, padding=1)
+            SineLayer(dim, dim_out)
         )
 
     def forward(self, x):
         return self.block(x)
 
 
-class ResnetBlock(nn.Module):
-    def __init__(self, dim, dim_out, time_emb_dim=None, dropout=0, norm_groups=32):
+class SIRENBlock(nn.Module):
+    def __init__(self, dim, dim_out, noise_level_emb_dim=None, dropout=0, use_affine_level=False, norm_groups=32):
         super().__init__()
-        self.mlp = nn.Sequential(
-            Swish(),
-            nn.Linear(time_emb_dim, dim_out)
-        ) if exists(time_emb_dim) else None
+        self.noise_func = FeatureWiseAffine(
+            noise_level_emb_dim, dim_out, use_affine_level)
 
         self.block1 = Block(dim, dim_out, groups=norm_groups)
         self.block2 = Block(dim_out, dim_out, groups=norm_groups, dropout=dropout)
-        self.res_conv = nn.Conv2d(
-            dim, dim_out, 1) if dim != dim_out else nn.Identity()
+        self.res_conv = SineLayer(
+            dim, dim_out) if dim != dim_out else nn.Identity()
 
     def forward(self, x, time_emb):
+        b, c, h, w = x.shape
         h = self.block1(x)
-        if exists(self.mlp):
-            h += self.mlp(time_emb)[:, :, None, None]
+        h = self.noise_func(h, time_emb)
         h = self.block2(h)
         return h + self.res_conv(x)
 
@@ -126,14 +140,36 @@ class SelfAttention(nn.Module):
         out = self.out(out.view(batch, channel, height, width))
 
         return out + input
+class SineLayer(nn.Module):
+    def __init__(self, in_features, out_features, bias=True,
+                 is_first=False, omega_0=30):
+        super().__init__()
+        self.omega_0 = omega_0
+        self.is_first = is_first
+        
+        self.in_features = in_features
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        
+        self.init_weights()
+    
+    def init_weights(self):
+        with torch.no_grad():
+            if self.is_first:
+                self.linear.weight.uniform_(-1 / self.in_features, 
+                                             1 / self.in_features)      
+            else:
+                self.linear.weight.uniform_(-np.sqrt(6 / self.in_features) / self.omega_0, 
+                                             np.sqrt(6 / self.in_features) / self.omega_0)
+        
+    def forward(self, input):
+        return torch.sin(self.omega_0 * self.linear(input))
 
-
-class ResnetBlocWithAttn(nn.Module):
-    def __init__(self, dim, dim_out, *, time_emb_dim=None, norm_groups=32, dropout=0, with_attn=False):
+class SIRENWithAttn(nn.Module):
+    def __init__(self, dim, dim_out, *, noise_level_emb_dim=None, norm_groups=32, dropout=0, with_attn=False):
         super().__init__()
         self.with_attn = with_attn
-        self.res_block = ResnetBlock(
-            dim, dim_out, time_emb_dim, norm_groups=norm_groups, dropout=dropout)
+        self.res_block = SIRENBlock(
+            dim, dim_out, noise_level_emb_dim, norm_groups=norm_groups, dropout=dropout)
         if with_attn:
             self.attn = SelfAttention(dim_out, norm_groups=norm_groups)
 
@@ -144,7 +180,7 @@ class ResnetBlocWithAttn(nn.Module):
         return x
 
 
-class UNet(nn.Module):
+class SIRENNET(nn.Module):
     def __init__(
         self,
         in_channel=6,
@@ -155,22 +191,22 @@ class UNet(nn.Module):
         attn_res=(8),
         res_blocks=3,
         dropout=0,
-        with_time_emb=True,
+        with_noise_level_emb=True,
         image_size=128
     ):
         super().__init__()
 
-        if with_time_emb:
-            time_dim = inner_channel
-            self.time_mlp = nn.Sequential(
-                TimeEmbedding(inner_channel),
+        if with_noise_level_emb:
+            noise_level_channel = inner_channel
+            self.noise_level_mlp = nn.Sequential(
+                PositionalEncoding(inner_channel),
                 nn.Linear(inner_channel, inner_channel * 4),
                 Swish(),
                 nn.Linear(inner_channel * 4, inner_channel)
             )
         else:
-            time_dim = None
-            self.time_mlp = None
+            noise_level_channel = None
+            self.noise_level_mlp = None
 
         num_mults = len(channel_mults)
         pre_channel = inner_channel
@@ -183,8 +219,8 @@ class UNet(nn.Module):
             use_attn = (now_res in attn_res)
             channel_mult = inner_channel * channel_mults[ind]
             for _ in range(0, res_blocks):
-                downs.append(ResnetBlocWithAttn(
-                    pre_channel, channel_mult, time_emb_dim=time_dim, norm_groups=norm_groups, dropout=dropout, with_attn=use_attn))
+                downs.append(SIRENWithAttn(
+                    pre_channel, channel_mult, noise_level_emb_dim=noise_level_channel, norm_groups=norm_groups, dropout=dropout, with_attn=use_attn))
                 feat_channels.append(channel_mult)
                 pre_channel = channel_mult
             if not is_last:
@@ -194,10 +230,10 @@ class UNet(nn.Module):
         self.downs = nn.ModuleList(downs)
 
         self.mid = nn.ModuleList([
-            ResnetBlocWithAttn(pre_channel, pre_channel, time_emb_dim=time_dim, norm_groups=norm_groups,
+            SIRENWithAttn(pre_channel, pre_channel, noise_level_emb_dim=noise_level_channel, norm_groups=norm_groups,
                                dropout=dropout, with_attn=True),
-            ResnetBlocWithAttn(pre_channel, pre_channel, time_emb_dim=time_dim, norm_groups=norm_groups, 
-                                dropout=dropout, with_attn=False)
+            SIRENWithAttn(pre_channel, pre_channel, noise_level_emb_dim=noise_level_channel, norm_groups=norm_groups,
+                               dropout=dropout, with_attn=False)
         ])
 
         ups = []
@@ -206,8 +242,9 @@ class UNet(nn.Module):
             use_attn = (now_res in attn_res)
             channel_mult = inner_channel * channel_mults[ind]
             for _ in range(0, res_blocks+1):
-                ups.append(ResnetBlocWithAttn(
-                    pre_channel+feat_channels.pop(), channel_mult, time_emb_dim=time_dim, dropout=dropout, norm_groups=norm_groups, with_attn=use_attn))
+                ups.append(SIRENWithAttn(
+                    pre_channel+feat_channels.pop(), channel_mult, noise_level_emb_dim=noise_level_channel, norm_groups=norm_groups,
+                        dropout=dropout, with_attn=use_attn))
                 pre_channel = channel_mult
             if not is_last:
                 ups.append(Upsample(pre_channel))
@@ -218,24 +255,25 @@ class UNet(nn.Module):
         self.final_conv = Block(pre_channel, default(out_channel, in_channel), groups=norm_groups)
 
     def forward(self, x, time):
-        t = self.time_mlp(time) if exists(self.time_mlp) else None
+        t = self.noise_level_mlp(time) if exists(
+            self.noise_level_mlp) else None
 
         feats = []
         for layer in self.downs:
-            if isinstance(layer, ResnetBlocWithAttn):
+            if isinstance(layer, SIRENWithAttn):
                 x = layer(x, t)
             else:
                 x = layer(x)
             feats.append(x)
 
         for layer in self.mid:
-            if isinstance(layer, ResnetBlocWithAttn):
+            if isinstance(layer, SIRENWithAttn):
                 x = layer(x, t)
             else:
                 x = layer(x)
 
         for layer in self.ups:
-            if isinstance(layer, ResnetBlocWithAttn):
+            if isinstance(layer, SIRENWithAttn):
                 x = layer(torch.cat((x, feats.pop()), dim=1), t)
             else:
                 x = layer(x)

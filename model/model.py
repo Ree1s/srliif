@@ -1,11 +1,15 @@
+from enum import auto
 import logging
 from collections import OrderedDict
-
+from data.util import *
 import torch
 import torch.nn as nn
 import os
 import model.networks as networks
 from .base_model import BaseModel
+import random
+import data.util as Util
+# from  torch.cuda.amp import autocast
 logger = logging.getLogger('base')
 
 
@@ -39,20 +43,46 @@ class DDPM(BaseModel):
             self.optG = torch.optim.Adam(
                 optim_params, lr=opt['train']["optimizer"]["lr"])
             self.log_dict = OrderedDict()
+        self.sub, self.div = torch.FloatTensor([0.5]).view(1, -1, 1, 1), torch.FloatTensor([0.5]).view(1, -1, 1, 1)
         self.load_network()
         self.print_network()
 
     def feed_data(self, data):
+        
+        # sub = torch.FloatTensor([0.5]).view(1, -1, 1, 1)
+        # div = torch.FloatTensor([0.5]).view(1, -1, 1, 1)
+        data['inp'] = (data['inp'] -self.sub) / self.div
+        data['gt'] = (data['gt'] -self.sub) / self.div
+        # p = random.random()
+        img_lr, img_hr = data['inp'], data['gt']
+        # w_hr = round(img_lr.shape[-1] + (img_hr.shape[-1] - img_lr.shape[-1]) * p)
+        # img_hr = resize_fn(img_hr, w_hr)
+        hr_coord, _ = Util.to_pixel_samples(img_hr)
+        cell = torch.ones_like(hr_coord)
+        cell[:, 0] *= 2 / img_hr.shape[-2]
+        cell[:, 1] *= 2 / img_hr.shape[-1]
+        hr_coord = hr_coord.repeat(img_hr.shape[0], 1, 1)
+        cell = cell.repeat(img_hr.shape[0], 1, 1)
+        data = {
+        'inp': img_lr,
+        'coord': hr_coord,
+        'cell': cell,
+        'gt': img_hr} 
         self.data = self.set_device(data)
-
-    def optimize_parameters(self):
+    def optimize_parameters(self, scaler):
         self.optG.zero_grad()
-        l_pix = self.netG(self.data)
+
+        with torch.cuda.amp.autocast():
+            l_pix = self.netG(self.data)
         # need to average in multi-gpu
-        b, c, h, w = self.data['HR'].shape
+        b, c, h, w = self.data['gt'].shape
         l_pix = l_pix.sum()/int(b*c*h*w)
-        l_pix.backward()
-        self.optG.step()
+        # print(l_pix)
+        scaler.scale(l_pix).backward()
+        scaler.step(self.optG)
+        scaler.update()
+        # l_pix.backward()
+        # self.optG.step()
 
         # set log
         self.log_dict['l_pix'] = l_pix.item()
@@ -62,10 +92,12 @@ class DDPM(BaseModel):
         with torch.no_grad():
             if isinstance(self.netG, nn.DataParallel):
                 self.SR = self.netG.module.super_resolution(
-                    self.data['SR'], continous)
+                    self.data, continous)
             else:
                 self.SR = self.netG.super_resolution(
-                    self.data['SR'], continous)
+                    self.data, continous)
+
+
         self.netG.train()
 
     def sample(self, batch_size=1, continous=False):
@@ -101,10 +133,10 @@ class DDPM(BaseModel):
             out_dict['SAM'] = self.SR.detach().float().cpu()
         else:
             out_dict['SR'] = self.SR.detach().float().cpu()
-            out_dict['INF'] = self.data['SR'].detach().float().cpu()
-            out_dict['HR'] = self.data['HR'].detach().float().cpu()
+            out_dict['INF'] = self.data['inp'].detach().float().cpu()
+            out_dict['HR'] = self.data['gt'].detach().float().cpu()
             if need_LR and 'LR' in self.data:
-                out_dict['LR'] = self.data['LR'].detach().float().cpu()
+                out_dict['LR'] = self.data['inp'].detach().float().cpu()
             else:
                 out_dict['LR'] = out_dict['INF']
         return out_dict
